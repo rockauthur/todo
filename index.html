@@ -101,6 +101,7 @@ input,select,textarea{font:inherit; color:inherit;}
   border:1px solid var(--border); border-radius:12px; padding:13px 14px; margin-bottom:8px;
 }
 .task.done .title{text-decoration:line-through; color:var(--muted);}
+.task.ctx{opacity:.55;}
 .chk{
   width:22px; height:22px; flex:none; margin-top:2px; border-radius:50%;
   border:2px solid #b9c4be; display:flex; align-items:center; justify-content:center; font-size:12px; color:#fff;
@@ -264,6 +265,7 @@ input,select,textarea{font:inherit; color:inherit;}
     <button class="nav-btn" data-view="someday"><span class="ico">💭</span>Someday / Maybe<span class="cnt" id="c-someday"></span></button>
     <button class="nav-btn" data-view="gantt"><span class="ico">📊</span>Gantt</button>
     <button class="nav-btn" data-view="done"><span class="ico">✅</span>Done</button>
+    <button class="nav-btn" data-view="archive"><span class="ico">🗄</span>Archive<span class="cnt" id="c-archive"></span></button>
     <div class="spacer"></div>
     <div class="foot">
       <button class="nav-btn" id="connectBtn" style="display:none"><span class="ico">🔗</span><span id="connectLbl">Connect data file</span></button>
@@ -286,6 +288,7 @@ input,select,textarea{font:inherit; color:inherit;}
   <button class="tab" data-view="someday"><span class="ico">💭</span>Someday</button>
   <button class="tab" data-view="gantt"><span class="ico">📊</span>Gantt</button>
   <button class="tab" data-view="done"><span class="ico">✅</span>Done</button>
+  <button class="tab" data-view="archive"><span class="ico">🗄</span>Archive</button>
 </div>
 
 <div id="overlay">
@@ -336,6 +339,7 @@ let state = { tasks: [], projects: [] };
 let view = 'inbox';
 let editingId = null;
 let q = '', fProj = '', fPri = '', sortBy = 'priority';
+let fDue = '', fDueFrom = '', fDueTo = '';
 const gCollapsed = new Set();
 
 const PROJ_COLORS = ['#1e7059','#2563b0','#b26a00','#c73a3f','#7a5cb0','#0e7f8a','#b0447e','#6b5a3e'];
@@ -359,6 +363,7 @@ function migrate(s){
   s.tasks.forEach(t => {
     if(typeof t.progress !== 'number') t.progress = 0;
     if(t.parentId === undefined) t.parentId = null;
+    if(t.archived === undefined) t.archived = null;
   });
 }
 function save(){
@@ -534,7 +539,8 @@ function esc(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/
 
 /* ================= task helpers ================= */
 function projOf(t){ return state.projects.find(p => p.id === t.projectId) || null; }
-function childrenOf(id){ return state.tasks.filter(t => t.parentId === id); }
+function childrenOf(id){ return state.tasks.filter(t => t.parentId === id && !t.archived); }
+function childrenOfAll(id){ return state.tasks.filter(t => t.parentId === id); }
 function descendants(id){
   const out = [];
   const walk = (x, depth) => {
@@ -544,10 +550,20 @@ function descendants(id){
   walk(id, 0);
   return out;
 }
+function descendantsAll(id){
+  const out = [];
+  const walk = (x, depth) => {
+    if(depth > 30) return;
+    childrenOfAll(x).forEach(c => { out.push(c); walk(c.id, depth+1); });
+  };
+  walk(id, 0);
+  return out;
+}
 function recomputeParents(){
   for(let pass = 0; pass < 25; pass++){
     let changed = false;
     state.tasks.forEach(t => {
+      if(t.archived) return;
       const kids = childrenOf(t.id);
       if(!kids.length) return;
       const avg = Math.round(kids.reduce((s,k) => s + (k.status==='done' ? 100 : (k.progress||0)), 0) / kids.length);
@@ -559,9 +575,27 @@ function recomputeParents(){
     if(!changed) break;
   }
 }
+function matchesDue(t){
+  if(!fDue) return true;
+  const today = todayStr();
+  if(fDue === 'overdue') return !!t.due && t.due < today && t.status !== 'done';
+  if(fDue === 'today')   return t.due === today;
+  if(fDue === 'week'){
+    const d = parseD(today), dow = (d.getDay()+6)%7; // Monday-based
+    return !!t.due && t.due >= dstr(addDays(d,-dow)) && t.due <= dstr(addDays(d,6-dow));
+  }
+  if(fDue === 'next7')   return !!t.due && t.due >= today && t.due <= dstr(addDays(parseD(today),7));
+  if(fDue === 'month')   return !!t.due && t.due.slice(0,7) === today.slice(0,7);
+  if(fDue === 'custom'){
+    if(!fDueFrom && !fDueTo) return true;
+    return !!t.due && (!fDueFrom || t.due >= fDueFrom) && (!fDueTo || t.due <= fDueTo);
+  }
+  return true;
+}
 function matchesFilters(t){
   if(fProj && (t.projectId||'') !== fProj) return false;
   if(fPri !== '' && String(t.priority||0) !== fPri) return false;
+  if(!matchesDue(t)) return false;
   if(!q) return true;
   const p = projOf(t);
   const hay = (t.title+' '+(t.notes||'')+' '+(t.tags||[]).join(' ')+' '+(p?p.name:'')).toLowerCase();
@@ -596,7 +630,7 @@ function setStatus(t, s){
 
 /* ================= rendering ================= */
 const content = document.getElementById('content');
-const TITLES = {inbox:'Inbox', next:'Next Actions', projects:'Projects', someday:'Someday / Maybe', gantt:'Gantt Chart', done:'Done'};
+const TITLES = {inbox:'Inbox', next:'Next Actions', projects:'Projects', someday:'Someday / Maybe', gantt:'Gantt Chart', done:'Done', archive:'Archive'};
 
 function render(){
   document.querySelectorAll('.nav-btn[data-view],.tab').forEach(b =>
@@ -604,22 +638,24 @@ function render(){
   updateCounts();
   if(view === 'gantt') renderGantt();
   else if(view === 'projects') renderProjects();
+  else if(view === 'archive') renderArchive();
   else renderList(view);
 }
 
 function updateCounts(){
-  const c = s => state.tasks.filter(t => t.status === s).length;
+  const c = s => state.tasks.filter(t => t.status === s && !t.archived).length;
   document.getElementById('c-inbox').textContent = c('inbox') || '';
   document.getElementById('c-next').textContent = c('next') || '';
   document.getElementById('c-someday').textContent = c('someday') || '';
   document.getElementById('c-projects').textContent = state.projects.length || '';
+  document.getElementById('c-archive').textContent = state.tasks.filter(t => t.archived).length || '';
 }
 
 function headHTML(){
-  const open = state.tasks.filter(t => t.status !== 'done');
+  const open = state.tasks.filter(t => t.status !== 'done' && !t.archived);
   const soonLimit = dstr(addDays(parseD(todayStr()), 3));
   const dueSoon = open.filter(t => t.due && t.due <= soonLimit).length;
-  const doneN = state.tasks.filter(t => t.status === 'done').length;
+  const doneN = state.tasks.filter(t => t.status === 'done' && !t.archived).length;
   return `<div id="viewHead">
     <div class="t">
       <div class="eyebrow">Task workspace</div>
@@ -645,12 +681,24 @@ function filtersHTML(){
       <option value="1" ${fPri==='1'?'selected':''}>P1</option>
       <option value="0" ${fPri==='0'?'selected':''}>P2</option>
     </select></div>
+    <div class="fitem"><label>Due</label><select id="fDue">
+      <option value="">All</option>
+      <option value="overdue" ${fDue==='overdue'?'selected':''}>Overdue</option>
+      <option value="today" ${fDue==='today'?'selected':''}>Today</option>
+      <option value="week" ${fDue==='week'?'selected':''}>This week</option>
+      <option value="next7" ${fDue==='next7'?'selected':''}>Next 7 days</option>
+      <option value="month" ${fDue==='month'?'selected':''}>This month</option>
+      <option value="custom" ${fDue==='custom'?'selected':''}>Custom range…</option>
+    </select></div>
+    ${fDue==='custom'?`
+    <div class="fitem"><label>From</label><input type="date" id="fDueFrom" value="${fDueFrom}"></div>
+    <div class="fitem"><label>To</label><input type="date" id="fDueTo" value="${fDueTo}"></div>`:''}
     <div class="fitem"><label>Sort</label><select id="fSort">
       <option value="priority" ${sortBy==='priority'?'selected':''}>Priority</option>
       <option value="due" ${sortBy==='due'?'selected':''}>Due date</option>
       <option value="created" ${sortBy==='created'?'selected':''}>Newest</option>
     </select></div>
-    ${(q||fProj||fPri!=='')?`<button id="clearFilters">✕ Clear</button>`:''}
+    ${(q||fProj||fPri!==''||fDue)?`<button id="clearFilters">✕ Clear</button>`:''}
   </div>`;
 }
 function bindFilters(){
@@ -658,9 +706,13 @@ function bindFilters(){
   s.addEventListener('input', e => { q = e.target.value.trim(); rerenderKeepFocus(); });
   document.getElementById('fProj').addEventListener('change', e => { fProj = e.target.value; render(); });
   document.getElementById('fPri').addEventListener('change', e => { fPri = e.target.value; render(); });
+  document.getElementById('fDue').addEventListener('change', e => { fDue = e.target.value; render(); });
+  const df = document.getElementById('fDueFrom'), dt = document.getElementById('fDueTo');
+  if(df) df.addEventListener('change', e => { fDueFrom = e.target.value; render(); });
+  if(dt) dt.addEventListener('change', e => { fDueTo = e.target.value; render(); });
   document.getElementById('fSort').addEventListener('change', e => { sortBy = e.target.value; render(); });
   const cf = document.getElementById('clearFilters');
-  if(cf) cf.addEventListener('click', () => { q=''; fProj=''; fPri=''; render(); });
+  if(cf) cf.addEventListener('click', () => { q=''; fProj=''; fPri=''; fDue=''; fDueFrom=''; fDueTo=''; render(); });
 }
 function rerenderKeepFocus(){
   render();
@@ -681,7 +733,7 @@ function bindQuickAdd(status){
   document.getElementById('quickAddBtn').addEventListener('click', go);
 }
 
-function taskHTML(t){
+function taskHTML(t, isCtx){
   const p = projOf(t);
   const today = todayStr();
   const kids = childrenOf(t.id);
@@ -699,12 +751,19 @@ function taskHTML(t){
   }
   (t.tags||[]).forEach(tag => pills += `<span class="pill tag">#${esc(tag)}</span>`);
   let acts = `<div class="acts">`;
-  if(t.status === 'inbox'){
-    acts += `<button data-act="toNext">⚡ Next</button><button data-act="toSomeday">💭 Later</button>`;
+  if(t.archived){
+    const ad = new Date(t.archived);
+    pills += `<span class="pill start">🗄 ${ad.toLocaleDateString('en-US',{month:'short',day:'numeric'})}</span>`;
+    acts += `<button data-act="restore">↩ Restore</button><button class="solid" data-act="edit2">Edit</button></div>`;
+  } else {
+    if(t.status === 'inbox'){
+      acts += `<button data-act="toNext">⚡ Next</button><button data-act="toSomeday">💭 Later</button>`;
+    }
+    if(t.status !== 'done') acts += `<button data-act="addSub">＋ Sub</button>`;
+    acts += `<button data-act="archive" title="Archive">🗄</button>`;
+    acts += `<button class="solid" data-act="edit2">Edit</button></div>`;
   }
-  if(t.status !== 'done') acts += `<button data-act="addSub">＋ Sub</button>`;
-  acts += `<button class="solid" data-act="edit2">Edit</button></div>`;
-  return `<div class="task ${t.status==='done'?'done':''}" data-id="${t.id}">
+  return `<div class="task ${t.status==='done'?'done':''}${isCtx?' ctx':''}" data-id="${t.id}">
     <button class="chk ${t.status==='done'?'on':''}" data-act="toggle">${t.status==='done'?'✓':''}</button>
     <div class="body" data-act="edit">
       <div class="pills">${pills}</div>
@@ -715,13 +774,28 @@ function taskHTML(t){
   </div>`;
 }
 
-function renderTree(tasks){
+function withAncestors(matching, extraCond){
+  const setIds = new Set(matching.map(t => t.id));
+  const ctxIds = new Set();
+  matching.forEach(t => {
+    let x = t, g = 0;
+    while(x.parentId && g++ < 30){
+      const p = state.tasks.find(y => y.id === x.parentId);
+      if(!p) break;
+      if(!setIds.has(p.id) && extraCond(p)){ setIds.add(p.id); ctxIds.add(p.id); }
+      x = p;
+    }
+  });
+  return { tasks: state.tasks.filter(t => setIds.has(t.id)), ctxIds };
+}
+
+function renderTree(tasks, ctxIds){
   const set = new Set(tasks.map(t => t.id));
   const roots = tasks.filter(t => !t.parentId || !set.has(t.parentId));
   const walk = (t, depth) => {
-    let h = taskHTML(t);
+    let h = taskHTML(t, ctxIds && ctxIds.has(t.id));
     if(depth <= 30){
-      const kids = sortTasks(childrenOf(t.id).filter(c => set.has(c.id)));
+      const kids = sortTasks(childrenOfAll(t.id).filter(c => set.has(c.id)));
       if(kids.length) h += `<div class="tkids">${kids.map(c => walk(c, depth+1)).join('')}</div>`;
     }
     return `<div class="tnode">${h}</div>`;
@@ -755,6 +829,20 @@ function bindTaskEvents(root){
         }
         else if(act === 'toNext') setStatus(t, 'next');
         else if(act === 'toSomeday') setStatus(t, 'someday');
+        else if(act === 'archive'){
+          const desc = descendantsAll(t.id).filter(k => !k.archived);
+          if(!desc.length || confirm(`Archive this task and its ${desc.length} subtask(s)?`)){
+            const now = Date.now();
+            t.archived = now;
+            desc.forEach(k => k.archived = now);
+            save(); render();
+          }
+        }
+        else if(act === 'restore'){
+          t.archived = null;
+          descendantsAll(t.id).forEach(k => k.archived = null);
+          save(); render();
+        }
         else if(act === 'addSub'){
           const title = prompt('Subtask title / 子任务:');
           if(title && title.trim()) addTask(title, t.status, t.id);
@@ -766,7 +854,9 @@ function bindTaskEvents(root){
 }
 
 function renderList(status){
-  const tasks = sortTasks(state.tasks.filter(t => t.status === status && matchesFilters(t)));
+  const matching = state.tasks.filter(t => t.status === status && !t.archived && matchesFilters(t));
+  const { tasks: treeTasks, ctxIds } = withAncestors(matching, p => p.status === status);
+  const tasks = sortTasks(matching);
   const ph = {inbox:'Capture anything… 随手记 (Enter to add)', next:'Add a next action…', someday:'Add a someday/maybe…', done:''}[status];
   let html = headHTML();
   if(status !== 'done') html += quickAddHTML(ph);
@@ -780,10 +870,24 @@ function renderList(status){
     }[status];
     html += `<div class="empty">${msg}</div>`;
   } else {
-    html += renderTree(tasks);
+    html += renderTree(treeTasks, ctxIds);
   }
   content.innerHTML = html;
   if(status !== 'done') bindQuickAdd(status);
+  bindFilters();
+  bindTaskEvents(content);
+}
+
+/* ================= archive view ================= */
+function renderArchive(){
+  const matching = state.tasks.filter(t => t.archived && matchesFilters(t));
+  let html = headHTML() + filtersHTML();
+  if(matching.length === 0){
+    html += `<div class="empty">Archive is empty.<br>Use the 🗄 button on any task to move it here; Restore brings it back, Edit → Delete removes it forever.</div>`;
+  } else {
+    html += renderTree(matching);
+  }
+  content.innerHTML = html;
   bindFilters();
   bindTaskEvents(content);
 }
@@ -794,19 +898,24 @@ function renderProjects(){
   html += quickAddHTML('Add task to Inbox…');
   html += filtersHTML();
   html += `<div class="proj-add"><button id="newProjBtn">＋ New project</button></div>`;
-  const groups = [...state.projects.map(p => ({p, tasks: state.tasks.filter(t => t.projectId === p.id && t.status !== 'done' && matchesFilters(t))}))];
-  const loose = state.tasks.filter(t => !projOf(t) && t.status !== 'done' && t.status !== 'someday' && matchesFilters(t));
+  const groups = [...state.projects.map(p => {
+    const matching = state.tasks.filter(t => t.projectId === p.id && t.status !== 'done' && !t.archived && matchesFilters(t));
+    const { tasks, ctxIds } = withAncestors(matching, a => a.projectId === p.id && a.status !== 'done' && !a.archived);
+    return {p, tasks, ctxIds, openN: matching.length};
+  })];
+  const looseMatch = state.tasks.filter(t => !projOf(t) && t.status !== 'done' && t.status !== 'someday' && !t.archived && matchesFilters(t));
+  const looseTree = withAncestors(looseMatch, a => !projOf(a) && a.status !== 'done' && a.status !== 'someday' && !a.archived);
   if(groups.length === 0) html += `<div class="empty">No projects yet.<br>A project = anything that takes more than one step.</div>`;
-  groups.forEach(({p, tasks}) => {
-    const doneN = state.tasks.filter(t => t.projectId === p.id && t.status === 'done').length;
+  groups.forEach(({p, tasks, ctxIds, openN}) => {
+    const doneN = state.tasks.filter(t => t.projectId === p.id && t.status === 'done' && !t.archived).length;
     html += `<div class="group-h"><span class="dot" style="background:${p.color}"></span>${esc(p.name)}
-      <span class="mini">${tasks.length} open · ${doneN} done</span>
+      <span class="mini">${openN} open · ${doneN} done</span>
       <button class="mini" data-renameproj="${p.id}" style="margin-left:auto;color:var(--muted)">✏️</button></div>`;
-    html += tasks.length ? renderTree(tasks) : `<div class="empty" style="padding:12px">No open tasks — add one or archive this project.</div>`;
+    html += tasks.length ? renderTree(tasks, ctxIds) : `<div class="empty" style="padding:12px">No open tasks — add one or archive this project.</div>`;
   });
-  if(loose.length){
+  if(looseTree.tasks.length){
     html += `<div class="group-h"><span class="dot" style="background:#b9c4be"></span>No project</div>`;
-    html += renderTree(loose);
+    html += renderTree(looseTree.tasks, looseTree.ctxIds);
   }
   content.innerHTML = html;
   bindQuickAdd('inbox');
@@ -835,7 +944,7 @@ function renderProjects(){
 
 /* ================= gantt ================= */
 function renderGantt(){
-  const dated = state.tasks.filter(t => (t.due || t.start) && t.status !== 'someday' && matchesFilters(t));
+  const dated = state.tasks.filter(t => (t.due || t.start) && t.status !== 'someday' && !t.archived && matchesFilters(t));
   let html = headHTML() + filtersHTML();
   if(dated.length === 0){
     content.innerHTML = html + `<div class="empty">No dated tasks yet.<br>Give tasks a start / due date and they will appear here. 📅</div>`;
@@ -853,8 +962,8 @@ function renderGantt(){
       inc.add(p.id); x = p;
     }
   });
-  // pull in ALL descendants of shown tasks (even undated), except someday
-  [...inc].forEach(id => descendants(id).forEach(k => { if(k.status !== 'someday') inc.add(k.id); }));
+  // pull in descendants of shown tasks (even undated), except someday; they must pass active filters
+  [...inc].forEach(id => descendants(id).forEach(k => { if(k.status !== 'someday' && matchesFilters(k)) inc.add(k.id); }));
   function ganttSpan(t){
     let s = null, e = null;
     const consider = (a,b) => { if(!a) return; if(!s || a < s) s = a; if(!e || b > e) e = b; };
@@ -1068,7 +1177,7 @@ document.getElementById('mSave').addEventListener('click', () => {
   save(); closeModal(); render();
 });
 document.getElementById('mDelete').addEventListener('click', () => {
-  const desc = descendants(editingId);
+  const desc = descendantsAll(editingId);
   const msg = desc.length ? `Delete this task AND its ${desc.length} subtask(s)?` : 'Delete this task?';
   if(confirm(msg)){
     const ids = new Set([editingId, ...desc.map(d => d.id)]);
@@ -1159,6 +1268,11 @@ if(state.tasks.length === 0 && !localStorage.getItem(LS_KEY)){
 render();
 updateConnectUI();
 restoreHandle();
+// re-check the data file whenever the tab regains focus (picks up iPhone changes)
+window.addEventListener('focus', () => { if(fileHandle) syncFromFile(); });
+document.addEventListener('visibilitychange', () => {
+  if(document.visibilityState === 'visible' && fileHandle) syncFromFile();
+});
 </script>
 </body>
 </html>
