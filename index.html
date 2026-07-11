@@ -198,11 +198,22 @@ input,select,textarea{font:inherit; color:inherit;}
 #ganttHint{color:var(--muted); font-size:12.5px; margin:10px 2px;}
 
 /* ---------- modal ---------- */
-#overlay{
+#overlay,#gistOverlay{
   position:fixed; inset:0; background:rgba(25,35,30,.5); z-index:50;
   display:none; align-items:flex-end; justify-content:center;
 }
-#overlay.show{display:flex;}
+#overlay.show,#gistOverlay.show{display:flex;}
+#gistModal{
+  background:var(--panel); width:100%; max-width:520px; border-radius:16px 16px 0 0;
+  padding:18px 18px calc(18px + env(safe-area-inset-bottom)); max-height:92vh; overflow:auto;
+}
+#gistModal h2{font-size:17px; font-weight:800; margin-bottom:6px;}
+#gistModal .hint{font-size:12.5px; color:var(--muted); line-height:1.6; margin-bottom:14px;}
+#gistModal .hint a{color:var(--accent);}
+#gistBtns{display:flex; gap:10px; margin-top:16px;}
+#gSave{flex:1; background:var(--accent); color:#fff; border-radius:9px; padding:10px; font-weight:800;}
+#gDisc{border:1px solid var(--border); color:var(--danger); border-radius:9px; padding:10px 14px;}
+#gCancel{border:1px solid var(--border); color:var(--muted); border-radius:9px; padding:10px 14px;}
 #modal{
   background:var(--panel); width:100%; max-width:520px; border-radius:16px 16px 0 0;
   padding:18px 18px calc(18px + env(safe-area-inset-bottom)); max-height:92vh; overflow:auto;
@@ -268,6 +279,7 @@ input,select,textarea{font:inherit; color:inherit;}
     <button class="nav-btn" data-view="archive"><span class="ico">🗄</span>Archive<span class="cnt" id="c-archive"></span></button>
     <div class="spacer"></div>
     <div class="foot">
+      <button class="nav-btn" id="gistBtn"><span class="ico">☁️</span><span id="gistLbl">Cloud sync</span></button>
       <button class="nav-btn" id="connectBtn" style="display:none"><span class="ico">🔗</span><span id="connectLbl">Connect data file</span></button>
       <button class="nav-btn" id="exportBtn"><span class="ico">⬇️</span>Export backup</button>
       <button class="nav-btn" id="importBtn"><span class="ico">⬆️</span>Import backup</button>
@@ -280,6 +292,24 @@ input,select,textarea{font:inherit; color:inherit;}
 </div>
 
 <input type="file" id="loadFile" accept=".json,application/json" style="display:none">
+
+<div id="gistOverlay">
+  <div id="gistModal">
+    <h2>☁️ Cloud sync (GitHub Gist)</h2>
+    <div class="hint">
+      Your data auto-syncs through a <b>private Gist</b> in your own GitHub account.<br>
+      1. Create a token at <a href="https://github.com/settings/tokens/new?scopes=gist&description=TODO%20app%20sync" target="_blank" rel="noopener">github.com/settings/tokens/new</a> — keep only the <b>gist</b> scope, set expiration to your liking.<br>
+      2. Paste it below on each device. The app finds (or creates) the data gist automatically.
+    </div>
+    <div class="frow"><label>GitHub token (gist scope)</label><input type="password" id="gToken" placeholder="ghp_… / github_pat_…" autocomplete="off"></div>
+    <div class="frow"><label>Gist ID (optional — auto-detected)</label><input type="text" id="gId" placeholder="leave empty" autocomplete="off"></div>
+    <div id="gistBtns">
+      <button id="gDisc">Disconnect</button>
+      <button id="gCancel">Cancel</button>
+      <button id="gSave">Save & sync</button>
+    </div>
+  </div>
+</div>
 
 <div id="tabbar">
   <button class="tab" data-view="inbox"><span class="ico">📥</span>Inbox</button>
@@ -372,6 +402,97 @@ function save(){
   state.meta.updatedAt = Date.now();
   localStorage.setItem(LS_KEY, JSON.stringify(state));
   scheduleFileWrite();
+  scheduleGistPush();
+}
+
+/* ================= GitHub Gist cloud sync ================= */
+const GIST_FILE = 'todo-data.json';
+let gistToken = localStorage.getItem('gtd-gist-token') || '';
+let gistId = localStorage.getItem('gtd-gist-id') || '';
+let gistStatus = gistToken ? 'idle' : 'off'; // off|idle|sync|ok|err
+let gistLastOk = Number(localStorage.getItem('gtd-gist-ok') || 0);
+let gistTimer = null, gistBusy = false;
+
+function gistHeaders(){
+  return { 'Authorization': 'Bearer ' + gistToken, 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json' };
+}
+function setGistStatus(s){
+  gistStatus = s;
+  const sb = document.getElementById('syncBar');
+  if(sb) sb.outerHTML = syncBarHTML();
+}
+function scheduleGistPush(ms){
+  if(!gistToken) return;
+  clearTimeout(gistTimer);
+  gistTimer = setTimeout(gistPush, ms || 1800);
+}
+async function gistPush(){
+  if(!gistToken || gistBusy) { if(gistBusy) scheduleGistPush(2500); return; }
+  gistBusy = true; setGistStatus('sync');
+  try{
+    const files = {}; files[GIST_FILE] = { content: JSON.stringify(state, null, 2) };
+    let r;
+    if(gistId){
+      r = await fetch('https://api.github.com/gists/' + gistId, { method:'PATCH', headers: gistHeaders(), body: JSON.stringify({ files }) });
+      if(r.status === 404){ gistId = ''; localStorage.removeItem('gtd-gist-id'); }
+    }
+    if(!gistId){
+      r = await fetch('https://api.github.com/gists', { method:'POST', headers: gistHeaders(),
+        body: JSON.stringify({ description: 'TODO GTD app data (auto-sync)', public: false, files }) });
+    }
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const g = await r.json();
+    if(!gistId && g.id){ gistId = g.id; localStorage.setItem('gtd-gist-id', gistId); }
+    gistLastOk = Date.now(); localStorage.setItem('gtd-gist-ok', String(gistLastOk));
+    setGistStatus('ok');
+  }catch(e){ console.warn('gist push failed', e); setGistStatus('err'); }
+  gistBusy = false;
+}
+async function gistPull(){
+  if(!gistToken || !gistId || gistBusy) return;
+  gistBusy = true; setGistStatus('sync');
+  try{
+    const r = await fetch('https://api.github.com/gists/' + gistId, { headers: gistHeaders() });
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    const g = await r.json();
+    const f = g.files && g.files[GIST_FILE];
+    if(f){
+      let txt = f.content;
+      if(f.truncated){ const rr = await fetch(f.raw_url); txt = await rr.text(); }
+      const data = JSON.parse(txt);
+      if(data && Array.isArray(data.tasks)){
+        const remote = data.meta?.updatedAt || 0, local = state.meta?.updatedAt || 0;
+        if(remote > local){
+          migrate(data); state = data;
+          localStorage.setItem(LS_KEY, JSON.stringify(state));
+          render();
+        } else if(local > remote){
+          gistBusy = false; setGistStatus('ok'); scheduleGistPush(300); return;
+        }
+      }
+    }
+    gistLastOk = Date.now(); localStorage.setItem('gtd-gist-ok', String(gistLastOk));
+    setGistStatus('ok');
+  }catch(e){ console.warn('gist pull failed', e); setGistStatus('err'); }
+  gistBusy = false;
+}
+async function gistDiscover(){
+  // find an existing data gist in this account (for 2nd-device setup)
+  const r = await fetch('https://api.github.com/gists?per_page=100', { headers: gistHeaders() });
+  if(!r.ok) throw new Error('HTTP ' + r.status);
+  const list = await r.json();
+  const cands = list.filter(g => g.files && g.files[GIST_FILE])
+    .sort((a,b) => (b.updated_at||'').localeCompare(a.updated_at||''));
+  return cands.length ? cands[0].id : null;
+}
+function updateGistUI(){
+  const lbl = document.getElementById('gistLbl');
+  if(lbl) lbl.textContent = gistToken ? '✓ Cloud sync on' : 'Cloud sync';
+}
+function openGistModal(){
+  document.getElementById('gToken').value = gistToken;
+  document.getElementById('gId').value = gistId;
+  document.getElementById('gistOverlay').classList.add('show');
 }
 
 /* ================= data file sync ================= */
@@ -508,7 +629,12 @@ function updateConnectUI(){
   }
 }
 function syncBarHTML(){
-  if(fileHandle) return `<div id="syncBar"><span class="ok">🔗 Auto-saving to ${esc(fileHandle.name || 'data file')}</span></div>`;
+  if(gistToken){
+    const t = gistLastOk ? new Date(gistLastOk).toLocaleString('en-US', {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'}) : 'never';
+    const txt = { sync:'☁️ syncing…', ok:'☁️ synced · ' + t, err:'⚠️ sync error — check ⚙️', idle:'☁️ cloud sync on' }[gistStatus] || '☁️';
+    return `<div id="syncBar"><span class="${gistStatus==='err' ? 'dirty' : 'ok'}">${txt}</span><button id="sbGist">⚙️</button></div>`;
+  }
+  if(fileHandle) return `<div id="syncBar"><span class="ok">🔗 Auto-saving to ${esc(fileHandle.name || 'data file')}</span><button id="sbGist">☁️ Cloud sync</button></div>`;
   const last = Number(localStorage.getItem(SAVED_KEY) || 0);
   const dirty = (state.meta?.updatedAt || 0) > last;
   const when = last ? new Date(last).toLocaleString('en-US', {month:'short', day:'numeric', hour:'numeric', minute:'2-digit'}) : 'never';
@@ -516,6 +642,7 @@ function syncBarHTML(){
     <button id="sbSave">💾 Save file</button>
     <button id="sbLoad">📂 Load file</button>
     <span class="${dirty ? 'dirty' : ''}">${dirty ? '● unsaved changes' : '✓ saved'} · file: ${when}</span>
+    <button id="sbGist">☁️ Cloud sync</button>
   </div>`;
 }
 function uid(){ return Date.now().toString(36) + Math.random().toString(36).slice(2,7); }
@@ -1212,7 +1339,44 @@ content.addEventListener('click', e => {
     markSynced();
   } else if(id === 'sbLoad'){
     document.getElementById('loadFile').click();
+  } else if(id === 'sbGist'){
+    openGistModal();
   }
+});
+
+/* gist modal */
+document.getElementById('gistBtn').addEventListener('click', openGistModal);
+document.getElementById('gCancel').addEventListener('click', () => document.getElementById('gistOverlay').classList.remove('show'));
+document.getElementById('gistOverlay').addEventListener('click', e => { if(e.target.id === 'gistOverlay') e.target.classList.remove('show'); });
+document.getElementById('gDisc').addEventListener('click', () => {
+  gistToken = ''; gistId = ''; gistStatus = 'off';
+  localStorage.removeItem('gtd-gist-token'); localStorage.removeItem('gtd-gist-id'); localStorage.removeItem('gtd-gist-ok');
+  document.getElementById('gistOverlay').classList.remove('show');
+  updateGistUI(); render();
+});
+document.getElementById('gSave').addEventListener('click', async () => {
+  const tok = document.getElementById('gToken').value.trim();
+  const id = document.getElementById('gId').value.trim();
+  if(!tok){ alert('Please paste a GitHub token (gist scope).'); return; }
+  gistToken = tok; localStorage.setItem('gtd-gist-token', tok);
+  document.getElementById('gistOverlay').classList.remove('show');
+  updateGistUI();
+  try{
+    if(id){
+      gistId = id; localStorage.setItem('gtd-gist-id', id);
+      await gistPull();
+    } else {
+      setGistStatus('sync');
+      const found = await gistDiscover();
+      if(found){
+        gistId = found; localStorage.setItem('gtd-gist-id', found);
+        await gistPull();
+      } else {
+        await gistPush(); // creates the gist
+      }
+    }
+  }catch(e){ console.warn(e); setGistStatus('err'); }
+  render();
 });
 document.getElementById('loadFile').addEventListener('change', e => {
   const f = e.target.files[0];
@@ -1267,11 +1431,15 @@ if(state.tasks.length === 0 && !localStorage.getItem(LS_KEY)){
 }
 render();
 updateConnectUI();
+updateGistUI();
 restoreHandle();
-// re-check the data file whenever the tab regains focus (picks up iPhone changes)
-window.addEventListener('focus', () => { if(fileHandle) syncFromFile(); });
+if(gistToken && gistId) gistPull();
+// re-check data sources whenever the tab regains focus (picks up other-device changes)
+window.addEventListener('focus', () => { if(fileHandle) syncFromFile(); if(gistToken && gistId) gistPull(); });
 document.addEventListener('visibilitychange', () => {
-  if(document.visibilityState === 'visible' && fileHandle) syncFromFile();
+  if(document.visibilityState !== 'visible') return;
+  if(fileHandle) syncFromFile();
+  if(gistToken && gistId) gistPull();
 });
 </script>
 </body>
